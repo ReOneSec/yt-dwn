@@ -4,7 +4,7 @@ import time
 import re
 from pathlib import Path
 import json
-import uuid # Still useful for unique internal IDs, but not for callback_data directly
+import uuid
 
 import yt_dlp
 from yt_dlp.utils import DownloadError, ExtractorError, SameFileError, UnsupportedError
@@ -23,9 +23,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- Configure httpx logger to be less verbose ---
+# This stops the "HTTP Request: POST..." messages from httpx
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 # --- Configuration ---
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_ID_STR = os.getenv("TELEGRAM_ADMIN_ID")
+FFMPEG_PATH = os.getenv("FFMPEG_PATH") # Get ffmpeg path from .env
 
 if not TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN not found in .env file. Please set it.")
@@ -50,7 +55,6 @@ MAX_TELEGRAM_FILE_SIZE_BYTES = MAX_TELEGRAM_FILE_SIZE_MB * 1024 * 1024
 YOUTUBE_URL_REGEX = r"(?:https?:\/\/)?(?:www\.)?(?:m\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=|playlist\?list=|shorts\/|embed\/|v\/|)([a-zA-Z0-9_-]{11}|[a-zA-Z0-9_-]+)"
 
 # --- User State Management ---
-# Stores {chat_id: {'url': video_url, 'video_title': '...', 'message_id': ..., 'format_options': {short_id: {details}}}}
 user_states = {}
 
 # --- YouTube Standard Resolutions for Selection ---
@@ -58,39 +62,32 @@ TARGET_RESOLUTIONS = [144, 240, 360, 480, 720, 1080, 1440, 2160]
 
 # --- Helper to map yt-dlp formats to human-readable options ---
 def get_human_readable_formats(formats: list) -> list:
-    """
-    Analyzes yt-dlp formats and returns a list of human-readable options
-    suitable for inline keyboard buttons, focusing on standard resolutions.
-    Each option will have a short 'callback_id' for Telegram's limit.
-    """
     options = []
     seen_resolutions = set()
     
-    # Sort formats by height and then average bitrate (tbr) for consistency
     formats.sort(key=lambda f: (f.get('height') or 0, f.get('tbr') or 0), reverse=True)
 
     # 1. Audio Only Option
     audio_formats = [f for f in formats if f.get('vcodec') == 'none']
     if audio_formats:
-        # Prefer m4a if available, otherwise best audio available
         best_audio_format = next((f for f in audio_formats if f.get('ext') == 'm4a' and f.get('acodec')), None)
         if not best_audio_format:
             best_audio_format = max(audio_formats, key=lambda f: f.get('abr') or 0, default=None)
         
         if best_audio_format:
             options.append({
-                'callback_id': 'audio', # A fixed, short ID for audio
+                'callback_id': 'audio',
                 'label': '🎧 Audio Only (MP3)',
-                'format_string': 'bestaudio[ext=m4a]/bestaudio', # Try m4a, then any best audio
+                'format_string': 'bestaudio[ext=m4a]/bestaudio',
                 'is_audio': True
             })
 
     # 2. Video Formats (prioritizing MP4 and specific resolutions)
-    for target_height in TARGET_RESOLUTIONS[::-1]: # Iterate from highest to lowest resolution
+    for target_height in TARGET_RESOLUTIONS[::-1]:
         format_string = (
             f"bestvideo[height<={target_height}][ext=mp4]+bestaudio[ext=m4a]/"
-            f"best[ext=mp4][height<={target_height}]/" # Fallback to progressive MP4
-            f"best[ext=mp4]" # General MP4 fallback
+            f"best[ext=mp4][height<={target_height}]/"
+            f"best[ext=mp4]"
         )
         
         if target_height not in seen_resolutions:
@@ -103,7 +100,7 @@ def get_human_readable_formats(formats: list) -> list:
                 label += " (SD)"
             
             options.append({
-                'callback_id': f'v{target_height}', # e.g., 'v1080'
+                'callback_id': f'v{target_height}',
                 'label': label,
                 'format_string': format_string,
                 'is_audio': False
@@ -112,9 +109,9 @@ def get_human_readable_formats(formats: list) -> list:
 
     # 3. Best Overall Quality Option
     options.append({
-        'callback_id': 'best', # A fixed, short ID for best quality
+        'callback_id': 'best',
         'label': '⚡️ Best Overall Quality',
-        'format_string': 'bestvideo+bestaudio/best', # Highest quality, needs ffmpeg for merge
+        'format_string': 'bestvideo+bestaudio/best',
         'is_audio': False
     })
 
@@ -141,15 +138,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # --- yt-dlp Progress Hook ---
 def progress_hook(d: dict, update: Update, chat_id: int, logger: logging.Logger) -> None:
     if d['status'] == 'downloading':
-        if d.get('total_bytes') and d.get('total_bytes_estimate'): # Prefer actual if available
+        if d.get('total_bytes') and d.get('total_bytes_estimate'):
             total_mb = d['total_bytes'] / (1024 * 1024)
             downloaded_mb = d['downloaded_bytes'] / (1024 * 1024)
             logger.info(f"[Download Progress] {downloaded_mb:.2f}MB / {total_mb:.2f}MB")
-        elif d.get('total_bytes_estimate'): # Fallback to estimate
+        elif d.get('total_bytes_estimate'):
             total_mb = d['total_bytes_estimate'] / (1024 * 1024)
             downloaded_mb = d['downloaded_bytes'] / (1024 * 1024)
             logger.info(f"[Download Progress] {downloaded_mb:.2f}MB / ~{total_mb:.2f}MB (estimated)")
-        else: # Generic progress
+        else:
             logger.info(f"[Download Progress] {d.get('downloaded_bytes', 'Unknown')} bytes downloaded.")
     elif d['status'] == 'finished':
         logger.info(f"[Download Complete] {d['filename']}")
@@ -180,10 +177,11 @@ async def download_youtube_content(update: Update, context: ContextTypes.DEFAULT
         info_ydl_opts = {
             'quiet': True,
             'no_warnings': True,
-            'skip_download': True, # Important: just get info
-            'force_generic_extractor': True, # Helps with some URLs
-            'simulate': True, # Only simulate, don't download
-            'get_formats': True, # Get all available formats
+            'skip_download': True,
+            'force_generic_extractor': True,
+            'simulate': True,
+            'get_formats': True,
+            'ffmpeg_location': FFMPEG_PATH, # Explicitly set ffmpeg location
         }
 
         with yt_dlp.YoutubeDL(info_ydl_opts) as ydl:
@@ -198,10 +196,9 @@ async def download_youtube_content(update: Update, context: ContextTypes.DEFAULT
                 # Handle playlists: no format selection per video, just download best
                 await update.message.reply_text(
                     f"🎶 Found playlist: *{info.get('title', 'Untitled Playlist')}* with {info.get('playlist_count', len(info.get('entries', [])))} videos.\n"
-                    f"For playlists, I will attempt to download the best quality MP4 (requires `ffmpeg` for optimal quality).",
+                    f"For playlists, I will attempt to download the best quality MP4 (requires `ffmpeg`).",
                     parse_mode='Markdown'
                 )
-                # Default to best quality for playlists
                 await handle_download_selected_format(context, chat_id, url, is_playlist=True, format_string='bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best', is_audio_only=False)
             else:
                 # Handle single video: offer format selection
@@ -220,17 +217,14 @@ async def download_youtube_content(update: Update, context: ContextTypes.DEFAULT
                     return
 
                 keyboard_buttons = []
-                # Store options in a temp dict for this request, indexed by their short callback_id
                 current_format_options = {opt['callback_id']: opt for opt in human_formats}
 
                 for fmt_option in human_formats:
-                    # Use the short 'callback_id' directly for Telegram's callback_data
                     callback_data = fmt_option['callback_id']
                     
-                    # Check length before adding (should now be very short)
                     if len(callback_data.encode('utf-8')) > 64:
                         logger.warning(f"Callback data for format '{fmt_option['label']}' is still too long ({len(callback_data.encode('utf-8'))} bytes). Skipping this option.")
-                        continue # Skip this button if data is too long
+                        continue
 
                     keyboard_buttons.append([InlineKeyboardButton(fmt_option['label'], callback_data=callback_data)])
                 
@@ -241,12 +235,11 @@ async def download_youtube_content(update: Update, context: ContextTypes.DEFAULT
 
                 reply_markup = InlineKeyboardMarkup(keyboard_buttons)
                 
-                # Store state for this user, including all format options indexed by their short callback_id
                 user_states[chat_id] = {
                     'url': url,
                     'video_title': video_title,
-                    'message_id': None, # Will be updated with the sent message_id
-                    'format_options': current_format_options # Store options by their short callback_id
+                    'message_id': None,
+                    'format_options': current_format_options
                 }
 
                 sent_message = await update.message.reply_text(
@@ -259,13 +252,11 @@ async def download_youtube_content(update: Update, context: ContextTypes.DEFAULT
 
     except DownloadError as e:
         logger.error(f"yt-dlp info extraction error for URL {url}: {e}", exc_info=True)
-        # Specific check for ffmpeg error during info extraction (less common but possible)
         if "ffmpeg is not installed" in str(e):
             await update.message.reply_text(
                 "❌ Download failed: `ffmpeg` is not installed on the server. "
                 "For the bot to download and merge video/audio streams (which is needed for high quality), "
-                "please ensure `ffmpeg` is installed. If you are running this on Termux, you can install it using:\n"
-                "```bash\npkg install ffmpeg\n```",
+                "please ensure `ffmpeg` is installed and accessible in the system's PATH.",
                 parse_mode='Markdown'
             )
         else:
@@ -297,34 +288,30 @@ async def download_youtube_content(update: Update, context: ContextTypes.DEFAULT
 async def handle_format_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles callback queries from inline keyboard buttons for format selection."""
     query = update.callback_query
-    await query.answer() # Acknowledge the query immediately
+    await query.answer()
 
     chat_id = query.message.chat_id
-    selected_callback_id = query.data # This is now the short ID, e.g., 'v1080' or 'audio'
+    selected_callback_id = query.data
 
     try:
-        # Retrieve the full details from user_states using the short callback_id
         if chat_id not in user_states or 'format_options' not in user_states[chat_id] or selected_callback_id not in user_states[chat_id]['format_options']:
             await query.edit_message_text("This download request has expired or the format option is no longer available. Please send a new URL.")
             return
 
         selected_option = user_states[chat_id]['format_options'][selected_callback_id]
-        selected_url = user_states[chat_id]['url'] # Get original URL from state
+        selected_url = user_states[chat_id]['url']
         selected_format_string = selected_option['format_string']
         is_audio_only = selected_option['is_audio']
 
-        # Try to delete the inline keyboard or edit the message
         if user_states[chat_id].get('message_id') == query.message.message_id:
             await query.edit_message_text(f"✅ You chose: `{selected_option['label']}`. Starting download...", parse_mode='Markdown')
         else:
             await query.message.reply_text(f"✅ You chose: `{selected_option['label']}`. Starting download...", parse_mode='Markdown')
         
-        # Clear state after successful retrieval and message edit/reply
         del user_states[chat_id]
 
         logger.info(f"User {chat_id} selected format: {selected_format_string} (Audio Only: {is_audio_only}) for {selected_url}")
 
-        # Start the actual download
         await handle_download_selected_format(context, chat_id, selected_url, is_playlist=False, format_string=selected_format_string, is_audio_only=is_audio_only)
 
     except Exception as e:
@@ -338,42 +325,42 @@ async def handle_download_selected_format(context: ContextTypes.DEFAULT_TYPE, ch
     ydl_opts = {
         'format': format_string,
         'outtmpl': str(DOWNLOAD_DIR / '%(title)s.%(ext)s'),
-        'noplaylist': True, # Default for single video download via selected format
-        'progress_hooks': [lambda d: progress_hook(d, None, chat_id, logger)], # Pass None for update as it's not always available here
-        'quiet': True,
+        'noplaylist': True,
+        'progress_hooks': [lambda d: progress_hook(d, None, chat_id, logger)],
+        'quiet': True, # Changed to quiet for general operation, will be overridden by verbose in some cases
         'no_warnings': True,
-        'merge_output_format': 'mp4', # Default for merged video files
-        'postprocessors': []
+        'merge_output_format': 'mp4',
+        'postprocessors': [],
+        'ffmpeg_location': FFMPEG_PATH, # Explicitly set ffmpeg location from .env
+        # Set verbose: True ONLY for debugging this specific issue. Make sure to remove it later.
+        'verbose': True # TEMPORARY: Set to True for debugging. REMOVE AFTER FIXING!
     }
 
     if is_audio_only:
-        ydl_opts['format'] = 'bestaudio/best' # Ensure best audio is picked
+        ydl_opts['format'] = 'bestaudio/best'
         ydl_opts['extract_audio'] = True
-        ydl_opts['audio_format'] = 'mp3' # or 'm4a'
-        ydl_opts['audio_quality'] = 0 # best audio quality (0-9, 0 is best)
+        ydl_opts['audio_format'] = 'mp3'
+        ydl_opts['audio_quality'] = 0
         ydl_opts['postprocessors'].append({
             'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3', # Convert to mp3
-            'preferredquality': '192', # High quality audio bitrate
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
         })
-        ydl_opts['outtmpl'] = str(DOWNLOAD_DIR / '%(title)s.%(ext)s') # Ensure audio gets correct ext
+        ydl_opts['outtmpl'] = str(DOWNLOAD_DIR / '%(title)s.%(ext)s')
         logger.info(f"Preparing to download audio only for URL: {url}")
         
     if is_playlist:
-        ydl_opts['noplaylist'] = False # Allow playlist download
-        ydl_opts['extract_flat'] = True # Extract playlist info first
-        ydl_opts['playlistend'] = 20 # Limit for testing, remove for full playlist
-        # For playlists, we apply the default 'best' format, as per the initial message.
-        # No per-video format selection for playlists to keep it manageable.
+        ydl_opts['noplaylist'] = False
+        ydl_opts['extract_flat'] = True
+        ydl_opts['playlistend'] = 20
         ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-        is_audio_only = False # Ensure playlist items are treated as video downloads
+        is_audio_only = False
 
-    downloaded_files_paths = [] # To keep track of files for cleanup
+    downloaded_files_paths = []
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             if is_playlist:
-                # Re-extract playlist info to get entry URLs if extract_flat was used
                 playlist_info = ydl.extract_info(url, download=False)
                 if not playlist_info or 'entries' not in playlist_info:
                     await context.bot.send_message(chat_id=chat_id, text="❌ Could not extract videos from the playlist.")
@@ -401,13 +388,10 @@ async def handle_download_selected_format(context: ContextTypes.DEFAULT_TYPE, ch
                     )
                     logger.info(f"Attempting download for playlist item: {video_title} from {video_url}")
 
-                    # Individual download options for playlist item
-                    item_ydl_opts = ydl_opts.copy() # Start with overall options
-                    # Ensure unique filenames for playlist items to avoid overwriting
-                    # Sanitize title for filename
-                    sanitized_title = re.sub(r'[\\/:*?"<>|]', '', video_title) # Remove invalid characters
+                    item_ydl_opts = ydl_opts.copy()
+                    sanitized_title = re.sub(r'[\\/:*?"<>|]', '', video_title)
                     item_ydl_opts['outtmpl'] = str(DOWNLOAD_DIR / f'{sanitized_title}_{entry.get("id", "")}.%(ext)s') 
-                    item_ydl_opts['noplaylist'] = True # Only download this specific video
+                    item_ydl_opts['noplaylist'] = True
 
                     with yt_dlp.YoutubeDL(item_ydl_opts) as item_ydl:
                         item_info = item_ydl.extract_info(video_url, download=True)
@@ -420,21 +404,19 @@ async def handle_download_selected_format(context: ContextTypes.DEFAULT_TYPE, ch
                                 file_path = Path(item_info['_format_filepath'])
 
                             if not file_path or not file_path.exists() or file_path.stat().st_size == 0:
-                                logger.error(f"Playlist video {video_title} file missing or empty. Info: {json.dumps(item_info, indent=2)}")
+                                logger.error(f"Playlist video {video_title} file missing or empty. Full yt-dlp info: {json.dumps(item_info, indent=2)}")
                                 await context.bot.send_message(
                                     chat_id=chat_id,
                                     text=f"❌ Downloaded file for *{video_title}* is missing or empty. "
                                     f"This often happens if `ffmpeg` is not installed and needed for merging video/audio. "
-                                    f"If you are running this on Termux, try `pkg install ffmpeg`.",
+                                    f"Please ensure `ffmpeg` is installed and accessible in your system's PATH.",
                                     parse_mode='Markdown'
                                 )
                             else:
                                 downloaded_files_paths.append(file_path)
-                                await process_and_send_file(context, chat_id, video_title, file_path, is_audio_only)
-                        else:
-                            await context.bot.send_message(chat_id=chat_id, text=f"❌ Could not download playlist video *{video_title}*. Skipping.", parse_mode='Markdown')
+                                await context.bot.send_message(chat_id=chat_id, text=f"❌ Could not download playlist video *{video_title}*. Skipping.", parse_mode='Markdown')
                             logger.error(f"Failed to download playlist video: {video_title} from {video_url}")
-                    time.sleep(2) # Delay between videos
+                    time.sleep(2)
                 await context.bot.send_message(chat_id=chat_id, text="🥳 Playlist download attempt complete!")
 
             else: # Single video download logic
@@ -448,10 +430,10 @@ async def handle_download_selected_format(context: ContextTypes.DEFAULT_TYPE, ch
                         downloaded_file_path = Path(info['_format_filepath'])
 
                     if not downloaded_file_path or not downloaded_file_path.exists() or downloaded_file_path.stat().st_size == 0:
-                        logger.error(f"Downloaded file for {video_title} not found or empty. Info: {json.dumps(info, indent=2)}")
+                        logger.error(f"Downloaded file for {video_title} not found or empty. Full yt-dlp info: {json.dumps(info, indent=2)}")
                         await context.bot.send_message(chat_id=chat_id, text=f"❌ Downloaded file for *{video_title}* is missing or empty. "
                                                         f"This often happens if `ffmpeg` is not installed and needed for merging video/audio. "
-                                                        f"If you are running this on Termux, try `pkg install ffmpeg`.", parse_mode='Markdown')
+                                                        f"Please ensure `ffmpeg` is installed and accessible in your system's PATH.", parse_mode='Markdown')
                         return
 
                     downloaded_files_paths.append(downloaded_file_path)
