@@ -3,7 +3,7 @@ import os
 import time
 import re
 from pathlib import Path
-import json # For serializing/deserializing callback data
+import json
 import uuid # For generating unique IDs for callback data
 
 import yt_dlp
@@ -50,76 +50,85 @@ MAX_TELEGRAM_FILE_SIZE_BYTES = MAX_TELEGRAM_FILE_SIZE_MB * 1024 * 1024
 YOUTUBE_URL_REGEX = r"(?:https?:\/\/)?(?:www\.)?(?:m\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=|playlist\?list=|shorts\/|embed\/|v\/|)([a-zA-Z0-9_-]{11}|[a-zA-Z0-9_-]+)"
 
 # --- User State Management ---
-# Stores {chat_id: {'url': video_url, 'video_title': '...', 'message_id': ..., 'format_options': [{id: ..., label: ..., format_string: ..., is_audio: ...}]}}
-# This is an in-memory dictionary. For persistent state across restarts or
-# for a highly concurrent bot, a database (e.g., SQLite, Redis) would be better.
+# Stores {chat_id: {'url': video_url, 'video_title': '...', 'message_id': ..., 'format_options': {id: {details}}}}
+# For a production bot with high concurrency/persistence needs, a database (e.g., Redis) is recommended.
+# This in-memory solution works for most personal/small-scale deployments.
 user_states = {}
+
+# --- YouTube Standard Resolutions for Selection ---
+TARGET_RESOLUTIONS = [144, 240, 360, 480, 720, 1080, 1440, 2160]
 
 # --- Helper to map yt-dlp formats to human-readable options ---
 def get_human_readable_formats(formats: list) -> list:
     """
     Analyzes yt-dlp formats and returns a list of human-readable options
-    suitable for inline keyboard buttons.
-    Prioritizes MP4 and common resolutions, plus audio-only.
-    Returns a list of dictionaries: [{'id': 'unique_id', 'label': '720p HD MP4', 'format_string': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]', 'is_audio': False}, ...]
+    suitable for inline keyboard buttons, focusing on standard resolutions.
     """
     options = []
     seen_resolutions = set()
     
-    # Ensure height and tbr are treated as integers for sorting, even if None
-    formats.sort(key=lambda f: (f.get('height') or 0, f.get('tbr') or 0, f.get('ext', '')), reverse=True)
+    # Sort formats by height and then average bitrate (tbr) for consistency
+    formats.sort(key=lambda f: (f.get('height') or 0, f.get('tbr') or 0), reverse=True)
 
-    # 1. Audio Only
+    # 1. Audio Only Option
     audio_formats = [f for f in formats if f.get('vcodec') == 'none']
     if audio_formats:
-        # Prioritize m4a if available, otherwise best audio
-        best_audio = next((f for f in audio_formats if f.get('ext') == 'm4a' and f.get('acodec')), None)
-        if not best_audio:
-            best_audio = max(audio_formats, key=lambda f: f.get('abr', 0) or 0, default=None)
-
-        if best_audio:
+        # Prefer m4a if available, otherwise best audio available
+        best_audio_format = next((f for f in audio_formats if f.get('ext') == 'm4a' and f.get('acodec')), None)
+        if not best_audio_format:
+            best_audio_format = max(audio_formats, key=lambda f: f.get('abr') or 0, default=None)
+        
+        if best_audio_format:
             options.append({
-                'id': str(uuid.uuid4()), # Unique ID for callback data
+                'id': str(uuid.uuid4()),
                 'label': '🎧 Audio Only (MP3)',
-                'format_string': 'bestaudio[ext=m4a]/bestaudio', # Use bestaudio and prefer m4a for conversion
+                'format_string': 'bestaudio[ext=m4a]/bestaudio', # Try m4a, then any best audio
                 'is_audio': True
             })
 
-    # 2. Video Formats (MP4 preferred)
-    for f in formats:
-        # Filter for video formats that are not audio-only and are mp4
-        if f.get('vcodec') != 'none' and f.get('ext') == 'mp4':
-            height = f.get('height')
-            # Only add if height is available and not already added
-            if height and height not in seen_resolutions:
-                label = f"{height}p MP4"
-                # This format string tries to get the specific resolution video + best audio
-                # Fallback to progressive if separate streams are not available or merge fails
-                format_string = f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4][height={height}]/best"
-                
-                if height >= 1080:
-                    label += " (FHD)"
-                elif height >= 720:
-                    label += " (HD)"
-                else: # typically 480p, 360p, 240p
-                    label += " (SD)"
-                
-                options.append({
-                    'id': str(uuid.uuid4()), # Unique ID for callback data
-                    'label': label,
-                    'format_string': format_string,
-                    'is_audio': False
-                })
-                seen_resolutions.add(height)
-    
-    # 3. Add a "Best Overall Quality" option if not already covered by a specific resolution
-    if not any('Best Overall Quality' in opt['label'] for opt in options):
-        options.append({
-            'id': str(uuid.uuid4()), # Unique ID for callback data
-            'label': '⚡️ Best Overall Quality',
-            'format_string': 'bestvideo+bestaudio/best',
-            'is_audio': False
-        })
+    # 2. Video Formats (prioritizing MP4 and specific resolutions)
+    for target_height in TARGET_RESOLUTIONS[::-1]: # Iterate from lowest to highest resolution
+        # Find the best MP4 progressive or combined stream at or below target_height
+        # This format string will try to get best video + best audio and merge (needs ffmpeg)
+        # or fall back to a progressive stream at that height, or any best MP4.
+        format_string = (
+            f"bestvideo[height<={target_height}][ext=mp4]+bestaudio[ext=m4a]/"
+            f"best[ext=mp4][height<={target_height}]/" # Fallback to progressive MP4
+            f"best[ext=mp4]" # General MP4 fallback
+        )
+        
+        # Check if we can find a suitable format for this target_height to offer
+        # We simulate a download to see if yt-dlp would find a file for this format string
+        # This can be slow, so a simpler check might be needed for very large lists of formats.
+        # For simplicity, we just add the option if it hasn't been added already
+        # based on resolution. We're relying on yt-dlp to find the 'best'
+        # matching stream for the format string provided by the button.
+        
+        # Avoid duplicate labels for same effective resolution
+        if target_height not in seen_resolutions:
+            label = f"{target_height}p MP4"
+            if target_height >= 1080:
+                label += " (FHD)"
+            elif target_height >= 720:
+                label += " (HD)"
+            else:
+                label += " (SD)"
+            
+            options.append({
+                'id': str(uuid.uuid4()),
+                'label': label,
+                'format_string': format_string,
+                'is_audio': False
+            })
+            seen_resolutions.add(target_height)
+
+    # 3. Best Overall Quality Option (as a robust fallback)
+    options.append({
+        'id': str(uuid.uuid4()),
+        'label': '⚡️ Best Overall Quality',
+        'format_string': 'bestvideo+bestaudio/best', # Highest quality, needs ffmpeg for merge
+        'is_audio': False
+    })
 
     return options
 
@@ -144,15 +153,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # --- yt-dlp Progress Hook ---
 def progress_hook(d: dict, update: Update, chat_id: int, logger: logging.Logger) -> None:
     if d['status'] == 'downloading':
-        if d.get('total_bytes'):
+        if d.get('total_bytes') and d.get('total_bytes_estimate'): # Prefer actual if available
             total_mb = d['total_bytes'] / (1024 * 1024)
             downloaded_mb = d['downloaded_bytes'] / (1024 * 1024)
             logger.info(f"[Download Progress] {downloaded_mb:.2f}MB / {total_mb:.2f}MB")
-        elif d.get('total_bytes_estimate'):
+        elif d.get('total_bytes_estimate'): # Fallback to estimate
             total_mb = d['total_bytes_estimate'] / (1024 * 1024)
             downloaded_mb = d['downloaded_bytes'] / (1024 * 1024)
             logger.info(f"[Download Progress] {downloaded_mb:.2f}MB / ~{total_mb:.2f}MB (estimated)")
-        else:
+        else: # Generic progress
             logger.info(f"[Download Progress] {d.get('downloaded_bytes', 'Unknown')} bytes downloaded.")
     elif d['status'] == 'finished':
         logger.info(f"[Download Complete] {d['filename']}")
@@ -163,7 +172,7 @@ def progress_hook(d: dict, update: Update, chat_id: int, logger: logging.Logger)
 # --- Core Download Logic with yt-dlp ---
 
 async def download_youtube_content(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles incoming messages containing YouTube URLs and offers format selection."""
+    """Handles incoming messages containing YouTube URLs and offers format selection for single videos."""
     url = update.message.text
     chat_id = update.effective_chat.id
 
@@ -201,7 +210,7 @@ async def download_youtube_content(update: Update, context: ContextTypes.DEFAULT
                 # Handle playlists: no format selection per video, just download best
                 await update.message.reply_text(
                     f"🎶 Found playlist: *{info.get('title', 'Untitled Playlist')}* with {info.get('playlist_count', len(info.get('entries', [])))} videos.\n"
-                    f"For playlists, I will attempt to download the best quality progressive MP4 (requires `ffmpeg` for optimal quality).",
+                    f"For playlists, I will attempt to download the best quality MP4 (requires `ffmpeg` for optimal quality).",
                     parse_mode='Markdown'
                 )
                 # Default to best quality for playlists
@@ -224,15 +233,14 @@ async def download_youtube_content(update: Update, context: ContextTypes.DEFAULT
 
                 keyboard_buttons = []
                 for fmt_option in human_formats:
-                    # Callback data format: "action|chat_id|option_id"
-                    # Store the full format details in user_states, refer by ID
+                    # Callback data format: JSON string with only the option_id
                     callback_data = json.dumps({
                         'action': 'download_format',
-                        'chat_id': str(chat_id),
+                        'chat_id': str(chat_id), # Include chat_id to verify context
                         'option_id': fmt_option['id']
                     })
                     
-                    # Check length before adding
+                    # Check length before adding (uuid is ~36 chars, JSON overhead is small)
                     if len(callback_data.encode('utf-8')) > 64:
                         logger.warning(f"Callback data for format '{fmt_option['label']}' is still too long ({len(callback_data.encode('utf-8'))} bytes) even with ID. Skipping this option.")
                         continue # Skip this button if data is too long
@@ -545,3 +553,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
