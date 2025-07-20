@@ -87,8 +87,7 @@ def get_human_readable_formats(formats: list) -> list:
             })
 
     # 2. Video Formats (prioritizing MP4 and specific resolutions)
-    for target_height in TARGET_RESOLUTIONS[::-1]: # Iterate from lowest to highest resolution
-        # Find the best MP4 progressive or combined stream at or below target_height
+    for target_height in TARGET_RESOLUTIONS[::-1]: # Iterate from highest to lowest resolution to add them
         # This format string will try to get best video + best audio and merge (needs ffmpeg)
         # or fall back to a progressive stream at that height, or any best MP4.
         format_string = (
@@ -96,13 +95,6 @@ def get_human_readable_formats(formats: list) -> list:
             f"best[ext=mp4][height<={target_height}]/" # Fallback to progressive MP4
             f"best[ext=mp4]" # General MP4 fallback
         )
-        
-        # Check if we can find a suitable format for this target_height to offer
-        # We simulate a download to see if yt-dlp would find a file for this format string
-        # This can be slow, so a simpler check might be needed for very large lists of formats.
-        # For simplicity, we just add the option if it hasn't been added already
-        # based on resolution. We're relying on yt-dlp to find the 'best'
-        # matching stream for the format string provided by the button.
         
         # Avoid duplicate labels for same effective resolution
         if target_height not in seen_resolutions:
@@ -234,9 +226,9 @@ async def download_youtube_content(update: Update, context: ContextTypes.DEFAULT
                 keyboard_buttons = []
                 for fmt_option in human_formats:
                     # Callback data format: JSON string with only the option_id
+                    # The chat_id is retrieved directly from the update in handle_format_selection
                     callback_data = json.dumps({
                         'action': 'download_format',
-                        'chat_id': str(chat_id), # Include chat_id to verify context
                         'option_id': fmt_option['id']
                     })
                     
@@ -321,7 +313,7 @@ async def handle_format_selection(update: Update, context: ContextTypes.DEFAULT_
         option_id = data.get('option_id')
 
         # Ensure the callback is for this chat's active request and has a valid option_id
-        if action != 'download_format' or str(chat_id) != data.get('chat_id') or not option_id:
+        if action != 'download_format' or not option_id: # Removed chat_id check from data, now use update.message.chat_id
             logger.warning(f"Mismatch in callback data or action for chat {chat_id}. Data: {data}")
             await query.edit_message_text("❌ Invalid selection or request expired.")
             return
@@ -553,4 +545,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
