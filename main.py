@@ -420,6 +420,7 @@ async def handle_download_selected_format(context: ContextTypes.DEFAULT_TYPE, ch
                                 file_path = Path(item_info['_format_filepath'])
 
                             if not file_path or not file_path.exists() or file_path.stat().st_size == 0:
+                                logger.error(f"Playlist video {video_title} file missing or empty. Info: {json.dumps(item_info, indent=2)}")
                                 await context.bot.send_message(
                                     chat_id=chat_id,
                                     text=f"❌ Downloaded file for *{video_title}* is missing or empty. "
@@ -427,7 +428,6 @@ async def handle_download_selected_format(context: ContextTypes.DEFAULT_TYPE, ch
                                     f"If you are running this on Termux, try `pkg install ffmpeg`.",
                                     parse_mode='Markdown'
                                 )
-                                logger.error(f"Playlist video {video_title} file missing or empty: {file_path}")
                             else:
                                 downloaded_files_paths.append(file_path)
                                 await process_and_send_file(context, chat_id, video_title, file_path, is_audio_only)
@@ -448,10 +448,10 @@ async def handle_download_selected_format(context: ContextTypes.DEFAULT_TYPE, ch
                         downloaded_file_path = Path(info['_format_filepath'])
 
                     if not downloaded_file_path or not downloaded_file_path.exists() or downloaded_file_path.stat().st_size == 0:
+                        logger.error(f"Downloaded file for {video_title} not found or empty. Info: {json.dumps(info, indent=2)}")
                         await context.bot.send_message(chat_id=chat_id, text=f"❌ Downloaded file for *{video_title}* is missing or empty. "
                                                         f"This often happens if `ffmpeg` is not installed and needed for merging video/audio. "
                                                         f"If you are running this on Termux, try `pkg install ffmpeg`.", parse_mode='Markdown')
-                        logger.error(f"Downloaded file for {video_title} not found or empty: {downloaded_file_path}")
                         return
 
                     downloaded_files_paths.append(downloaded_file_path)
