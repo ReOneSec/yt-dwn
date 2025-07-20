@@ -4,6 +4,7 @@ import time
 import re
 from pathlib import Path
 import json # For serializing/deserializing callback data
+import uuid # For generating unique IDs for callback data
 
 import yt_dlp
 from yt_dlp.utils import DownloadError, ExtractorError, SameFileError, UnsupportedError
@@ -49,7 +50,7 @@ MAX_TELEGRAM_FILE_SIZE_BYTES = MAX_TELEGRAM_FILE_SIZE_MB * 1024 * 1024
 YOUTUBE_URL_REGEX = r"(?:https?:\/\/)?(?:www\.)?(?:m\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=|playlist\?list=|shorts\/|embed\/|v\/|)([a-zA-Z0-9_-]{11}|[a-zA-Z0-9_-]+)"
 
 # --- User State Management ---
-# Stores {chat_id: {'url': video_url, 'formats': [...], 'video_title': '...'}}
+# Stores {chat_id: {'url': video_url, 'video_title': '...', 'message_id': ..., 'format_options': [{id: ..., label: ..., format_string: ..., is_audio: ...}]}}
 # This is an in-memory dictionary. For persistent state across restarts or
 # for a highly concurrent bot, a database (e.g., SQLite, Redis) would be better.
 user_states = {}
@@ -60,12 +61,12 @@ def get_human_readable_formats(formats: list) -> list:
     Analyzes yt-dlp formats and returns a list of human-readable options
     suitable for inline keyboard buttons.
     Prioritizes MP4 and common resolutions, plus audio-only.
-    Returns a list of dictionaries: [{'label': '720p HD MP4', 'format_string': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]'}, ...]
+    Returns a list of dictionaries: [{'id': 'unique_id', 'label': '720p HD MP4', 'format_string': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]', 'is_audio': False}, ...]
     """
     options = []
     seen_resolutions = set()
     
-    # Fix: Ensure height and tbr are treated as integers for sorting, even if None
+    # Ensure height and tbr are treated as integers for sorting, even if None
     formats.sort(key=lambda f: (f.get('height') or 0, f.get('tbr') or 0, f.get('ext', '')), reverse=True)
 
     # 1. Audio Only
@@ -74,12 +75,15 @@ def get_human_readable_formats(formats: list) -> list:
         # Prioritize m4a if available, otherwise best audio
         best_audio = next((f for f in audio_formats if f.get('ext') == 'm4a' and f.get('acodec')), None)
         if not best_audio:
-            best_audio = max(audio_formats, key=lambda f: f.get('abr', 0) or 0, default=None) # Fix: Handle None for abr
+            best_audio = max(audio_formats, key=lambda f: f.get('abr', 0) or 0, default=None)
 
         if best_audio:
-            # Use 'bestaudio' for yt-dlp to pick the best audio available
-            options.append({'label': '🎧 Audio Only (MP3)', 'format_string': 'bestaudio[ext=m4a]/bestaudio', 'is_audio': True})
-
+            options.append({
+                'id': str(uuid.uuid4()), # Unique ID for callback data
+                'label': '🎧 Audio Only (MP3)',
+                'format_string': 'bestaudio[ext=m4a]/bestaudio', # Use bestaudio and prefer m4a for conversion
+                'is_audio': True
+            })
 
     # 2. Video Formats (MP4 preferred)
     for f in formats:
@@ -100,13 +104,22 @@ def get_human_readable_formats(formats: list) -> list:
                 else: # typically 480p, 360p, 240p
                     label += " (SD)"
                 
-                options.append({'label': label, 'format_string': format_string, 'is_audio': False})
+                options.append({
+                    'id': str(uuid.uuid4()), # Unique ID for callback data
+                    'label': label,
+                    'format_string': format_string,
+                    'is_audio': False
+                })
                 seen_resolutions.add(height)
     
     # 3. Add a "Best Overall Quality" option if not already covered by a specific resolution
-    # This ensures a fallback for complex cases or if user just wants the highest quality
     if not any('Best Overall Quality' in opt['label'] for opt in options):
-        options.append({'label': '⚡️ Best Overall Quality', 'format_string': 'bestvideo+bestaudio/best', 'is_audio': False})
+        options.append({
+            'id': str(uuid.uuid4()), # Unique ID for callback data
+            'label': '⚡️ Best Overall Quality',
+            'format_string': 'bestvideo+bestaudio/best',
+            'is_audio': False
+        })
 
     return options
 
@@ -211,35 +224,34 @@ async def download_youtube_content(update: Update, context: ContextTypes.DEFAULT
 
                 keyboard_buttons = []
                 for fmt_option in human_formats:
-                    # Callback data format: JSON string
+                    # Callback data format: "action|chat_id|option_id"
+                    # Store the full format details in user_states, refer by ID
                     callback_data = json.dumps({
                         'action': 'download_format',
-                        'chat_id': str(chat_id), # Store as string for JSON
-                        'url': url,
-                        'format': fmt_option['format_string'],
-                        'is_audio': fmt_option['is_audio']
+                        'chat_id': str(chat_id),
+                        'option_id': fmt_option['id']
                     })
-                    # Telegram callback_data limit is 64 bytes. JSON can be longer.
-                    # If it's too long, we'll need a different strategy (e.g., store in user_states by index)
+                    
+                    # Check length before adding
                     if len(callback_data.encode('utf-8')) > 64:
-                        logger.warning(f"Callback data for format '{fmt_option['label']}' is too long ({len(callback_data.encode('utf-8'))} bytes). Storing in state.")
-                        # Store the full data in user_states and use an index for callback
-                        # This requires a more complex state management system.
-                        # For now, let's try to keep it simple and hope most are under 64.
-                        # If this becomes a consistent issue, a more robust state management is needed.
-                        await update.message.reply_text(f"⚠️ Some format options might not be available due to Telegram's data limits. Trying simplified options.", parse_mode='Markdown')
-                        # Fallback to a simpler, shorter format string if possible, or skip.
+                        logger.warning(f"Callback data for format '{fmt_option['label']}' is still too long ({len(callback_data.encode('utf-8'))} bytes) even with ID. Skipping this option.")
                         continue # Skip this button if data is too long
 
                     keyboard_buttons.append([InlineKeyboardButton(fmt_option['label'], callback_data=callback_data)])
                 
+                if not keyboard_buttons:
+                    await update.message.reply_text(f"❌ No valid download options could be generated for *{video_title}* due to Telegram's data limits or other issues. Please try another video.", parse_mode='Markdown')
+                    logger.warning(f"No keyboard buttons generated for {video_title} due to callback data length issues.")
+                    return
+
                 reply_markup = InlineKeyboardMarkup(keyboard_buttons)
                 
-                # Store state for this user (primarily for message_id to edit later)
+                # Store state for this user, including all format options
                 user_states[chat_id] = {
                     'url': url,
                     'video_title': video_title,
-                    'message_id': None # Will be updated with the sent message_id
+                    'message_id': None, # Will be updated with the sent message_id
+                    'format_options': {opt['id']: opt for opt in human_formats} # Store options by their generated ID
                 }
 
                 sent_message = await update.message.reply_text(
@@ -298,24 +310,32 @@ async def handle_format_selection(update: Update, context: ContextTypes.DEFAULT_
     try:
         data = json.loads(callback_data_str)
         action = data.get('action')
-        # Ensure the callback is for this chat's active request
-        if action != 'download_format' or str(chat_id) != data.get('chat_id'):
+        option_id = data.get('option_id')
+
+        # Ensure the callback is for this chat's active request and has a valid option_id
+        if action != 'download_format' or str(chat_id) != data.get('chat_id') or not option_id:
             logger.warning(f"Mismatch in callback data or action for chat {chat_id}. Data: {data}")
             await query.edit_message_text("❌ Invalid selection or request expired.")
             return
 
-        selected_url = data['url']
-        selected_format_string = data['format']
-        is_audio_only = data.get('is_audio', False) # Get the is_audio flag
-
-        # Clear state immediately to prevent re-clicks
-        if chat_id in user_states and user_states[chat_id].get('message_id') == query.message.message_id:
-            await query.edit_message_text(f"✅ You chose: `{selected_format_string}`. Starting download...", parse_mode='Markdown')
-            del user_states[chat_id]
-        else:
-            # If state is gone or message_id doesn't match, it's an old click or duplicate
-            await query.message.reply_text("This download request has expired or was already processed. Please send a new URL.")
+        # Retrieve the full details from user_states using the option_id
+        if chat_id not in user_states or 'format_options' not in user_states[chat_id] or option_id not in user_states[chat_id]['format_options']:
+            await query.edit_message_text("This download request has expired or the format option is no longer available. Please send a new URL.")
             return
+
+        selected_option = user_states[chat_id]['format_options'][option_id]
+        selected_url = user_states[chat_id]['url'] # Get original URL from state
+        selected_format_string = selected_option['format_string']
+        is_audio_only = selected_option['is_audio']
+
+        # Try to delete the inline keyboard or edit the message
+        if user_states[chat_id].get('message_id') == query.message.message_id:
+            await query.edit_message_text(f"✅ You chose: `{selected_option['label']}`. Starting download...", parse_mode='Markdown')
+        else:
+            await query.message.reply_text(f"✅ You chose: `{selected_option['label']}`. Starting download...", parse_mode='Markdown')
+        
+        # Clear state after successful retrieval and message edit/reply
+        del user_states[chat_id]
 
         logger.info(f"User {chat_id} selected format: {selected_format_string} (Audio Only: {is_audio_only}) for {selected_url}")
 
@@ -400,7 +420,9 @@ async def handle_download_selected_format(update: Update, chat_id: int, url: str
                     # Individual download options for playlist item
                     item_ydl_opts = ydl_opts.copy() # Start with overall options
                     # Ensure unique filenames for playlist items to avoid overwriting
-                    item_ydl_opts['outtmpl'] = str(DOWNLOAD_DIR / f'{re.sub(r"[^\w\s.-]", "", video_title)}_{entry.get("id", "")}.%(ext)s') 
+                    # Sanitize title for filename
+                    sanitized_title = re.sub(r'[\\/:*?"<>|]', '', video_title) # Remove invalid characters
+                    item_ydl_opts['outtmpl'] = str(DOWNLOAD_DIR / f'{sanitized_title}_{entry.get("id", "")}.%(ext)s') 
                     item_ydl_opts['noplaylist'] = True # Only download this specific video
 
                     with yt_dlp.YoutubeDL(item_ydl_opts) as item_ydl:
@@ -523,4 +545,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
