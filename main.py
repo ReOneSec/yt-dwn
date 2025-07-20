@@ -71,6 +71,33 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Simply send me a YouTube video or playlist URL. I'll download it and send it back if the size permits."
     )
 
+# --- yt-dlp Progress Hook ---
+def progress_hook(d: dict, update: Update, chat_id: int, logger: logging.Logger) -> None:
+    """
+    A simple progress hook for yt-dlp.
+    Note: Telegram API limits how frequently messages can be sent.
+    Sending too many updates too quickly can lead to rate limiting.
+    This hook is intentionally basic to avoid excessive API calls.
+    """
+    if d['status'] == 'downloading':
+        # You can add more sophisticated progress reporting here if needed,
+        # but be mindful of Telegram's rate limits.
+        # For now, we just log the progress.
+        if d.get('total_bytes'):
+            total_mb = d['total_bytes'] / (1024 * 1024)
+            downloaded_mb = d['downloaded_bytes'] / (1024 * 1024)
+            logger.info(f"[Download Progress] {downloaded_mb:.2f}MB / {total_mb:.2f}MB")
+        elif d.get('total_bytes_estimate'):
+            total_mb = d['total_bytes_estimate'] / (1024 * 1024)
+            downloaded_mb = d['downloaded_bytes'] / (1024 * 1024)
+            logger.info(f"[Download Progress] {downloaded_mb:.2f}MB / ~{total_mb:.2f}MB (estimated)")
+        else:
+            logger.info(f"[Download Progress] {d.get('downloaded_bytes', 'Unknown')} bytes downloaded.")
+    elif d['status'] == 'finished':
+        logger.info(f"[Download Complete] {d['filename']}")
+    elif d['status'] == 'error':
+        logger.error(f"[Download Error] {d.get('error', 'Unknown error')}")
+
 # --- Core Download Logic with yt-dlp ---
 
 async def download_youtube_content(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -146,7 +173,8 @@ async def handle_download(update: Update, chat_id: int, url: str, is_playlist: b
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': str(DOWNLOAD_DIR / '%(title)s.%(ext)s'), # Save to DOWNLOAD_DIR
         'noplaylist': True, # Default to single video download behavior
-        'progress_hooks': [lambda d: progress_hook(d, update, chat_id, logger)], # Custom progress hook
+        # Pass update, chat_id, and logger to the progress_hook using a lambda
+        'progress_hooks': [lambda d: progress_hook(d, update, chat_id, logger)],
         'quiet': True, # Suppress console output from yt-dlp unless error
         'no_warnings': True, # Suppress warnings
         'merge_output_format': 'mp4', # Ensure merged formats are mp4
@@ -308,4 +336,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-            
+                    
