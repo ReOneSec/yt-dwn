@@ -101,9 +101,19 @@ async def download_youtube_content(update: Update, context: ContextTypes.DEFAULT
 
     except DownloadError as e:
         logger.error(f"yt-dlp Download Error for URL {url}: {e}", exc_info=True)
-        await update.message.reply_text(
-            f"❌ A download error occurred: {e}. The video/playlist might be unavailable, private, or geo-restricted."
-        )
+        # Specific check for ffmpeg error
+        if "ffmpeg is not installed" in str(e):
+            await update.message.reply_text(
+                "❌ Download failed: `ffmpeg` is not installed on the server. "
+                "For the bot to download and merge video/audio streams (which is needed for high quality), "
+                "please ensure `ffmpeg` is installed. If you are running this on Termux, you can install it using:\n"
+                "```bash\npkg install ffmpeg\n```",
+                parse_mode='Markdown'
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ A download error occurred: {e}. The video/playlist might be unavailable, private, or geo-restricted."
+            )
     except ExtractorError as e:
         logger.error(f"yt-dlp Extractor Error for URL {url}: {e}", exc_info=True)
         await update.message.reply_text(
@@ -131,7 +141,9 @@ async def handle_download(update: Update, chat_id: int, url: str, is_playlist: b
 
     # Define common yt-dlp options
     ydl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best', # Prioritize MP4, then best overall
+        # Prioritize best video + best audio (requires ffmpeg for merging)
+        # Fallback to best progressive MP4, then any best format
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': str(DOWNLOAD_DIR / '%(title)s.%(ext)s'), # Save to DOWNLOAD_DIR
         'noplaylist': True, # Default to single video download behavior
         'progress_hooks': [lambda d: progress_hook(d, update, chat_id, logger)], # Custom progress hook
@@ -296,4 +308,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-                            
+            
