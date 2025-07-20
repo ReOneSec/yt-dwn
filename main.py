@@ -47,10 +47,11 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True) # Ensure the directory exists
 MAX_TELEGRAM_FILE_SIZE_MB = 50
 MAX_TELEGRAM_FILE_SIZE_BYTES = MAX_TELEGRAM_FILE_SIZE_MB * 1024 * 1024
 
-# Regex for standard YouTube URL validation (pytube-compatible)
-STANDARD_YOUTUBE_URL_REGEX = r"(?:https?:\/\/)?(?:www\.)?(?:m\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=|playlist\?list=|shorts\/|embed\/|v\/|)([a-zA-Z0-9_-]{11}|[a-zA-Z0-9_-]+)"
+# Corrected Regex for standard YouTube URL validation (pytube-compatible)
+# This regex explicitly looks for youtube.com or youtu.be as the main domain.
+STANDARD_YOUTUBE_URL_REGEX = r"^(?:https?:\/\/)?(?:www\.)?(?:m\.)?(youtube\.com|youtu\.be)\/(?:watch\?v=|playlist\?list=|shorts\/|embed\/|v\/|)([a-zA-Z0-9_-]{11}|[a-zA-Z0-9_-]+)$"
 # Regex for the problematic googleusercontent.com URLs
-GOOGLEUSERCONTENT_YOUTUBE_URL_REGEX = r"http:\/\/googleusercontent\.com\/youtube\.com\/\d+"
+GOOGLEUSERCONTENT_YOUTUBE_URL_REGEX = r"^http:\/\/googleusercontent\.com\/youtube\.com\/\d+$"
 
 
 # --- Bot Command Handlers ---
@@ -84,7 +85,7 @@ async def download_youtube_content(update: Update, context: ContextTypes.DEFAULT
     # Specific check for googleusercontent.com URLs that pytube cannot handle
     if re.match(GOOGLEUSERCONTENT_YOUTUBE_URL_REGEX, url):
         await update.message.reply_text(
-            "❌ I received a `googleusercontent.com` YouTube URL. For downloading, please provide the direct YouTube link (e.g., `https://www.youtube.com/watch?v=...` or `https://youtu.be/...`)."
+            "❌ I received a `googleusercontent.com` YouTube URL. For downloading, please provide the direct YouTube link (e.g., `https://www.youtube.com/watch?v=dQw4w9WgXcQ` or `https://youtu.be/dQw4w9WgXcQ`)."
         )
         logger.warning(f"User provided googleusercontent.com URL which pytube cannot handle: {url}")
         return
@@ -372,4 +373,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-            
+    
