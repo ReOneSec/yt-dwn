@@ -202,7 +202,7 @@ async def download_youtube_content(update: Update, context: ContextTypes.DEFAULT
                     parse_mode='Markdown'
                 )
                 # Default to best quality for playlists
-                await handle_download_selected_format(update, chat_id, url, is_playlist=True, format_string='bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best', is_audio_only=False)
+                await handle_download_selected_format(context, chat_id, url, is_playlist=True, format_string='bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best', is_audio_only=False)
             else:
                 # Handle single video: offer format selection
                 available_formats = info.get('formats', [])
@@ -325,21 +325,21 @@ async def handle_format_selection(update: Update, context: ContextTypes.DEFAULT_
         logger.info(f"User {chat_id} selected format: {selected_format_string} (Audio Only: {is_audio_only}) for {selected_url}")
 
         # Start the actual download
-        await handle_download_selected_format(update, chat_id, selected_url, is_playlist=False, format_string=selected_format_string, is_audio_only=is_audio_only)
+        await handle_download_selected_format(context, chat_id, selected_url, is_playlist=False, format_string=selected_format_string, is_audio_only=is_audio_only)
 
     except Exception as e:
         logger.error(f"Error in handle_format_selection for chat {chat_id}: {e}", exc_info=True)
         await query.edit_message_text(f"❌ An unexpected error occurred with your selection: {e}. Please try again.")
 
 
-async def handle_download_selected_format(update: Update, chat_id: int, url: str, is_playlist: bool, format_string: str, is_audio_only: bool) -> None:
+async def handle_download_selected_format(context: ContextTypes.DEFAULT_TYPE, chat_id: int, url: str, is_playlist: bool, format_string: str, is_audio_only: bool) -> None:
     """Handles the actual download and sending of the video/audio with the chosen format."""
 
     ydl_opts = {
         'format': format_string,
         'outtmpl': str(DOWNLOAD_DIR / '%(title)s.%(ext)s'),
         'noplaylist': True, # Default for single video download via selected format
-        'progress_hooks': [lambda d: progress_hook(d, update, chat_id, logger)],
+        'progress_hooks': [lambda d: progress_hook(d, None, chat_id, logger)], # Pass None for update as it's not always available here
         'quiet': True,
         'no_warnings': True,
         'merge_output_format': 'mp4', # Default for merged video files
@@ -376,12 +376,13 @@ async def handle_download_selected_format(update: Update, chat_id: int, url: str
                 # Re-extract playlist info to get entry URLs if extract_flat was used
                 playlist_info = ydl.extract_info(url, download=False)
                 if not playlist_info or 'entries' not in playlist_info:
-                    await update.message.reply_text("❌ Could not extract videos from the playlist.")
+                    await context.bot.send_message(chat_id=chat_id, text="❌ Could not extract videos from the playlist.")
                     logger.error(f"Failed to get entries for playlist URL: {url}")
                     return
 
-                await update.message.reply_text(
-                    f"Starting download of {len(playlist_info['entries'])} videos from *{playlist_info.get('title', 'Untitled Playlist')}*...",
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Starting download of {len(playlist_info['entries'])} videos from *{playlist_info.get('title', 'Untitled Playlist')}*...",
                     parse_mode='Markdown'
                 )
 
@@ -393,8 +394,9 @@ async def handle_download_selected_format(update: Update, chat_id: int, url: str
                     video_url = entry['url']
                     video_title = entry.get('title', f"Video {i+1}")
                     
-                    await update.message.reply_text(
-                        f"\n🎬 Downloading video {i+1}/{len(playlist_info['entries'])}: *{video_title}*",
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"\n🎬 Downloading video {i+1}/{len(playlist_info['entries'])}: *{video_title}*",
                         parse_mode='Markdown'
                     )
                     logger.info(f"Attempting download for playlist item: {video_title} from {video_url}")
@@ -418,8 +420,9 @@ async def handle_download_selected_format(update: Update, chat_id: int, url: str
                                 file_path = Path(item_info['_format_filepath'])
 
                             if not file_path or not file_path.exists() or file_path.stat().st_size == 0:
-                                await update.message.reply_text(
-                                    f"❌ Downloaded file for *{video_title}* is missing or empty. Skipping. "
+                                await context.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=f"❌ Downloaded file for *{video_title}* is missing or empty. "
                                     f"This often happens if `ffmpeg` is not installed and needed for merging video/audio. "
                                     f"If you are running this on Termux, try `pkg install ffmpeg`.",
                                     parse_mode='Markdown'
@@ -427,12 +430,12 @@ async def handle_download_selected_format(update: Update, chat_id: int, url: str
                                 logger.error(f"Playlist video {video_title} file missing or empty: {file_path}")
                             else:
                                 downloaded_files_paths.append(file_path)
-                                await process_and_send_file(update, chat_id, video_title, file_path, is_audio_only)
+                                await process_and_send_file(context, chat_id, video_title, file_path, is_audio_only)
                         else:
-                            await update.message.reply_text(f"❌ Could not download playlist video *{video_title}*. Skipping.", parse_mode='Markdown')
+                            await context.bot.send_message(chat_id=chat_id, text=f"❌ Could not download playlist video *{video_title}*. Skipping.", parse_mode='Markdown')
                             logger.error(f"Failed to download playlist video: {video_title} from {video_url}")
                     time.sleep(2) # Delay between videos
-                await update.message.reply_text("🥳 Playlist download attempt complete!")
+                await context.bot.send_message(chat_id=chat_id, text="🥳 Playlist download attempt complete!")
 
             else: # Single video download logic
                 info = ydl.extract_info(url, download=True)
@@ -445,16 +448,16 @@ async def handle_download_selected_format(update: Update, chat_id: int, url: str
                         downloaded_file_path = Path(info['_format_filepath'])
 
                     if not downloaded_file_path or not downloaded_file_path.exists() or downloaded_file_path.stat().st_size == 0:
-                        await update.message.reply_text(f"❌ Downloaded file for *{video_title}* is missing or empty. "
+                        await context.bot.send_message(chat_id=chat_id, text=f"❌ Downloaded file for *{video_title}* is missing or empty. "
                                                         f"This often happens if `ffmpeg` is not installed and needed for merging video/audio. "
                                                         f"If you are running this on Termux, try `pkg install ffmpeg`.", parse_mode='Markdown')
                         logger.error(f"Downloaded file for {video_title} not found or empty: {downloaded_file_path}")
                         return
 
                     downloaded_files_paths.append(downloaded_file_path)
-                    await process_and_send_file(update, chat_id, video_title, downloaded_file_path, is_audio_only)
+                    await process_and_send_file(context, chat_id, video_title, downloaded_file_path, is_audio_only)
                 else:
-                    await update.message.reply_text("❌ Could not download video or retrieve its information.")
+                    await context.bot.send_message(chat_id=chat_id, text="❌ Could not download video or retrieve its information.")
                     logger.error(f"No info returned after downloading single video from URL: {url}")
 
     finally:
@@ -463,13 +466,14 @@ async def handle_download_selected_format(update: Update, chat_id: int, url: str
                 os.remove(file_path)
                 logger.info(f"Cleaned up temporary file: {file_path}")
 
-async def process_and_send_file(update: Update, chat_id: int, title: str, file_path: Path, is_audio_only: bool) -> None:
+async def process_and_send_file(context: ContextTypes.DEFAULT_TYPE, chat_id: int, title: str, file_path: Path, is_audio_only: bool) -> None:
     """Handles file size check and sending the video/audio to Telegram."""
     file_size = file_path.stat().st_size
     file_size_mb = file_size / (1024 * 1024)
 
-    await update.message.reply_text(
-        f"✅ Finished downloading *{title}* (Size: {file_size_mb:.2f} MB).\nAttempting to send via Telegram...",
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"✅ Finished downloading *{title}* (Size: {file_size_mb:.2f} MB).\nAttempting to send via Telegram...",
         parse_mode='Markdown'
     )
     logger.info(f"Processing file for sending: {title}, Size: {file_size_mb:.2f} MB, Path: {file_path}")
@@ -490,19 +494,21 @@ async def process_and_send_file(update: Update, chat_id: int, title: str, file_p
                         caption=f"Downloaded Video: {title}",
                         supports_streaming=True
                     )
-            await update.message.reply_text(f"🎉 Successfully sent *{title}*!", parse_mode='Markdown')
+            await context.bot.send_message(chat_id=chat_id, text=f"🎉 Successfully sent *{title}*!", parse_mode='Markdown')
             logger.info(f"Successfully sent {title} to chat_id {chat_id}")
         except Exception as e:
             logger.error(f"Error sending file {title} to Telegram (chat_id {chat_id}): {e}", exc_info=True)
-            await update.message.reply_text(
-                f"⚠️ Failed to send *{title}* via Telegram: {e}.\n"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ Failed to send *{title}* via Telegram: {e}.\n"
                 f"This can happen if the file format is not supported by Telegram, or due to a network issue. "
                 f"Please try again or download manually.",
                 parse_mode='Markdown'
             )
     else:
-        await update.message.reply_text(
-            f"⚠️ File *{title}* (Size: {file_size_mb:.2f} MB) is too large to send directly via Telegram (max {MAX_TELEGRAM_FILE_SIZE_MB} MB).\n"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ File *{title}* (Size: {file_size_mb:.2f} MB) is too large to send directly via Telegram (max {MAX_TELEGRAM_FILE_SIZE_MB} MB).\n"
             f"You'll need to download it manually from YouTube.",
             parse_mode='Markdown'
         )
