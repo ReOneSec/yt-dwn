@@ -1,7 +1,7 @@
 import logging
 import os
 import time
-import re # Import regex for basic URL validation
+import re
 from pytube import YouTube, Playlist
 from pytube.exceptions import PytubeError, RegexMatchError, VideoUnavailable
 
@@ -44,12 +44,14 @@ DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True) # Ensure the directory exists
 
 # Telegram's general file upload limit is around 50 MB (50 * 1024 * 1024 bytes)
-# While some video types might allow larger, 50MB is a safe general threshold for direct sends.
 MAX_TELEGRAM_FILE_SIZE_MB = 50
 MAX_TELEGRAM_FILE_SIZE_BYTES = MAX_TELEGRAM_FILE_SIZE_MB * 1024 * 1024
 
-# Regex for basic YouTube URL validation
-YOUTUBE_URL_REGEX = r"(?:https?:\/\/)?(?:www\.)?(?:m\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=|playlist\?list=|shorts\/|embed\/|v\/|)([a-zA-Z0-9_-]{11}|[a-zA-Z0-9_-]+)"
+# Regex for standard YouTube URL validation (pytube-compatible)
+STANDARD_YOUTUBE_URL_REGEX = r"(?:https?:\/\/)?(?:www\.)?(?:m\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=|playlist\?list=|shorts\/|embed\/|v\/|)([a-zA-Z0-9_-]{11}|[a-zA-Z0-9_-]+)"
+# Regex for the problematic googleusercontent.com URLs
+GOOGLEUSERCONTENT_YOUTUBE_URL_REGEX = r"http:\/\/googleusercontent\.com\/youtube\.com\/\d+"
+
 
 # --- Bot Command Handlers ---
 
@@ -77,15 +79,25 @@ async def download_youtube_content(update: Update, context: ContextTypes.DEFAULT
     url = update.message.text
     chat_id = update.effective_chat.id
 
-    # Basic URL validation before calling pytube
-    if not re.match(YOUTUBE_URL_REGEX, url):
+    logger.info(f"Received URL: {url} from user {update.effective_user.id}")
+
+    # Specific check for googleusercontent.com URLs that pytube cannot handle
+    if re.match(GOOGLEUSERCONTENT_YOUTUBE_URL_REGEX, url):
         await update.message.reply_text(
-            "❌ That doesn't look like a valid YouTube video or playlist URL. Please send a direct link to a YouTube video or playlist."
+            "❌ I received a `googleusercontent.com` YouTube URL. For downloading, please provide the direct YouTube link (e.g., `https://www.youtube.com/watch?v=...` or `https://youtu.be/...`)."
         )
+        logger.warning(f"User provided googleusercontent.com URL which pytube cannot handle: {url}")
+        return
+
+    # Basic URL validation for standard YouTube URLs
+    if not re.match(STANDARD_YOUTUBE_URL_REGEX, url):
+        await update.message.reply_text(
+            "❌ That doesn't look like a valid standard YouTube video or playlist URL. Please send a direct link to a YouTube video or playlist."
+        )
+        logger.warning(f"Invalid standard YouTube URL format: {url}")
         return
 
     await update.message.reply_text("⏳ Received your URL! Checking for valid YouTube content...")
-    logger.info(f"Received URL: {url} from user {update.effective_user.id}")
 
     try:
         # Check if it's a playlist URL
@@ -97,7 +109,7 @@ async def download_youtube_content(update: Update, context: ContextTypes.DEFAULT
 
     except RegexMatchError:
         # Pytube raises RegexMatchError if the URL is not a valid YouTube URL pattern
-        logger.warning(f"RegexMatchError for URL: {url}")
+        logger.warning(f"RegexMatchError for URL: {url} (pytube couldn't parse it)")
         await update.message.reply_text(
             "❌ That doesn't look like a valid YouTube video or playlist URL. Please try again with a correct link."
         )
@@ -132,6 +144,7 @@ async def download_youtube_content(update: Update, context: ContextTypes.DEFAULT
 async def handle_single_video_download(update: Update, chat_id: int, url: str) -> None:
     """Downloads and sends a single YouTube video."""
     yt = YouTube(url)
+    # Accessing yt.title here is safe because the URL validation already passed
     await update.message.reply_text(
         f"🔍 Found video: *{yt.title}*.\nStarting download...", parse_mode='Markdown'
     )
@@ -359,4 +372,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
+            
