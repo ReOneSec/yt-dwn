@@ -226,20 +226,18 @@ async def main() -> None:
     application.post_init = download_worker
 
     # --- Conversation Handler ---
-    # We add per_message=False to the CallbackQueryHandler to resolve the PTBUserWarning
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start), MessageHandler(filters.TEXT & ~filters.COMMAND, ask_for_format)],
         states={
             CHOOSING_FORMAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_for_format)],
-            DOWNLOADING: [CallbackQueryHandler(process_download_choice, per_message=False)],
+            # REMOVED per_message=False from the line below
+            DOWNLOADING: [CallbackQueryHandler(process_download_choice)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        # ADDED per_message=False to the ConversationHandler itself
+        per_message=False
     )
-
-    application.add_handler(conv_handler)
     
-    logger.info("Bot starting...")
-
     # Initialize the application and start the updater to drop pending updates
     await application.initialize()
     await application.updater.start_polling(drop_pending_updates=True)
