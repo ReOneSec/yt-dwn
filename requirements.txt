@@ -1,2 +1,4 @@
-pip uninstall python-telegram-bot
-pip install "python-telegram-bot>=20.0" yt-dlp aiohttp ffmpeg
+python-telegram-bot
+yt-dlp
+aiohttp
+ffmpeg
