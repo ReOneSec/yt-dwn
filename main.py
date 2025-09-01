@@ -48,13 +48,12 @@ async def upload_to_gofile(file_path):
 
             # 2. Upload the file
             url = f"https://{server}.gofile.io/uploadFile"
-            async with aiohttp.FormData() as form_data:
-                form_data.add_field('file', open(file_path, 'rb'))
-                async with session.post(url, data=form_data) as upload_response:
+            with open(file_path, 'rb') as f:
+                async with session.post(url, data={'file': f}) as upload_response:
                     if upload_response.status != 200:
                         return None
                     upload_data = await upload_response.json()
-                    return upload_data["data"]["downloadPage"]
+                    return upload_data.get("data", {}).get("downloadPage")
     except Exception as e:
         logger.error(f"GoFile upload failed: {e}")
         return None
@@ -89,15 +88,17 @@ async def process_download_choice(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     await query.answer()
 
-    url = context.user_data['url']
+    url = context.user_data.get('url')
+    if not url:
+        await query.edit_message_text(text="Sorry, something went wrong. Please send the link again.")
+        return ConversationHandler.END
+
     format_choice = query.data
     chat_id = update.effective_chat.id
-    
-    # Add job to the queue
-    message = await query.edit_message_text(text=" M_Bot Is On Work")
+
+    message = await query.edit_message_text(text="Your request has been added to the queue... ⏳")
     await download_queue.put((chat_id, message.message_id, url, format_choice))
-    
-    await context.bot.send_message(chat_id, text="Your request has been added to the queue. ⏳")
+
     return ConversationHandler.END
 
 async def download_worker(app: Application):
@@ -108,25 +109,27 @@ async def download_worker(app: Application):
         try:
             await process_download(app.bot, chat_id, message_id, url, format_choice)
         except Exception as e:
-            logger.error(f"Error processing download for {url}: {e}")
-            await app.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text="❌ An unexpected error occurred during processing."
-            )
+            logger.error(f"Error processing download for {url}: {e}", exc_info=True)
+            try:
+                await app.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text="❌ An unexpected error occurred during processing."
+                )
+            except Exception as e2:
+                logger.error(f"Failed to even send error message: {e2}")
         finally:
             download_queue.task_done()
 
 # --- The Core Download Logic ---
 async def process_download(bot, chat_id, message_id, url, format_choice):
     """The main download and processing function, called by the worker."""
-    last_update_time = 0
+    last_update_time = [0] # Use a list to make it mutable inside the hook
 
     def progress_hook(d):
-        nonlocal last_update_time
         if d['status'] == 'downloading':
             current_time = time.time()
-            if current_time - last_update_time < 2: # Limit updates to every 2 seconds
+            if current_time - last_update_time[0] < 2:
                 return
 
             total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate')
@@ -135,30 +138,32 @@ async def process_download(bot, chat_id, message_id, url, format_choice):
                 percent = downloaded_bytes / total_bytes * 100
                 progress = int(percent / 10)
                 bar = '█' * progress + '─' * (10 - progress)
-                speed = d.get('speed')
-                eta = d.get('eta')
+                eta = d.get('eta', 'N/A')
                 
-                # Use asyncio to run the async bot method from this sync hook
-                asyncio.run_coroutine_threadsafe(
-                    bot.edit_message_text(
-                        f"Downloading...\n`[{bar}] {percent:.1f}%`\n\nETA: {eta}s",
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        parse_mode='MarkdownV2'
-                    ),
-                    asyncio.get_running_loop()
-                )
-                last_update_time = current_time
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        bot.edit_message_text(
+                            f"Downloading\\.\\.\\.\n`[{bar}] {percent:.1f}%`\n\nETA: {eta}s",
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            parse_mode='MarkdownV2'
+                        ),
+                        asyncio.get_running_loop()
+                    )
+                    last_update_time[0] = current_time
+                except Exception:
+                    # Ignore errors if message editing fails (e.g., message too old)
+                    pass
 
-    # Setup yt-dlp options based on choice
     if not os.path.exists(DOWNLOAD_PATH):
         os.makedirs(DOWNLOAD_PATH)
         
     ydl_opts = {
         'outtmpl': os.path.join(DOWNLOAD_PATH, '%(title)s.%(ext)s'),
-        'noplaylist': True, # For simplicity, we handle one video at a time
+        'noplaylist': True,
         'progress_hooks': [progress_hook],
         'quiet': True,
+        'noprogress': True,
     }
 
     if format_choice == 'audio':
@@ -168,16 +173,14 @@ async def process_download(bot, chat_id, message_id, url, format_choice):
             'preferredcodec': 'mp3',
             'preferredquality': '192',
         }]
-    else: # video
+    else:
         ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
 
-    # Download
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            await bot.edit_message_text("Starting download process...", chat_id=chat_id, message_id=message_id)
-            info = ydl.extract_info(url, download=True)
+            await bot.edit_message_text("Starting download...", chat_id=chat_id, message_id=message_id)
+            info = await asyncio.to_thread(ydl.extract_info, url, download=True)
             file_path = ydl.prepare_filename(info)
-            # For audio, the extension changes after post-processing
             if format_choice == 'audio':
                 file_path = os.path.splitext(file_path)[0] + '.mp3'
     except Exception as e:
@@ -185,47 +188,41 @@ async def process_download(bot, chat_id, message_id, url, format_choice):
         await bot.edit_message_text("❌ Download failed. The video might be private or unavailable.", chat_id=chat_id, message_id=message_id)
         return
 
-    # Upload and send
-    await bot.edit_message_text("✅ Download complete! Now uploading to Telegram...", chat_id=chat_id, message_id=message_id)
+    await bot.edit_message_text("✅ Download complete! Uploading...", chat_id=chat_id, message_id=message_id)
     
+    if not os.path.exists(file_path):
+         await bot.edit_message_text("❌ Error: Downloaded file not found.", chat_id=chat_id, message_id=message_id)
+         return
+
     if os.path.getsize(file_path) > MAX_FILE_SIZE_MB * 1024 * 1024:
-        await bot.edit_message_text("File is >50MB. Uploading to gofile.io, this may take a while...", chat_id=chat_id, message_id=message_id)
+        await bot.edit_message_text("File is >50MB. Uploading to file host...", chat_id=chat_id, message_id=message_id)
         download_link = await upload_to_gofile(file_path)
         if download_link:
-            await bot.send_message(chat_id, f"File was too large for Telegram.\n\nDownload it here: {download_link}")
+            await bot.send_message(chat_id, f"File was too large for Telegram.\nDownload it here: {download_link}")
         else:
-            await bot.send_message(chat_id, "❌ Sorry, failed to upload the large file to a sharing service.")
+            await bot.send_message(chat_id, "❌ Sorry, failed to upload the large file.")
     else:
-        media_file = open(file_path, 'rb')
-        caption_text = os.path.basename(file_path)
         try:
             if format_choice == 'audio':
-                await bot.send_audio(chat_id=chat_id, audio=media_file, caption=caption_text)
+                await bot.send_audio(chat_id=chat_id, audio=open(file_path, 'rb'), caption=os.path.basename(file_path))
             else:
-                await bot.send_video(chat_id=chat_id, video=media_file, caption=caption_text, supports_streaming=True)
+                await bot.send_video(chat_id=chat_id, video=open(file_path, 'rb'), caption=os.path.basename(file_path), supports_streaming=True)
         except Exception as e:
             logger.error(f"Telegram upload failed: {e}")
             await bot.send_message(chat_id, "❌ Sorry, failed to upload the file to Telegram.")
 
-    # Cleanup
     await bot.delete_message(chat_id=chat_id, message_id=message_id)
-    os.remove(file_path)
+    if os.path.exists(file_path):
+        os.remove(file_path)
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancels and ends the conversation."""
     await update.message.reply_text("Operation canceled.")
     return ConversationHandler.END
 
-
 async def main() -> None:
-    """Run the bot."""
-    # The application object
     application = Application.builder().token(BOT_TOKEN).build()
-    
-    # This line sets up the worker to run in the background
     application.post_init = download_worker
 
-    # --- Conversation Handler with the per_message fix ---
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start), MessageHandler(filters.TEXT & ~filters.COMMAND, ask_for_format)],
         states={
@@ -233,23 +230,18 @@ async def main() -> None:
             DOWNLOADING: [CallbackQueryHandler(process_download_choice)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False  # Correct location for this argument
+        per_message=False
     )
 
     application.add_handler(conv_handler)
     
     logger.info("Bot starting...")
 
-    # This startup sequence is crucial
-    # 1. initialize() runs the post_init worker
     await application.initialize()
-    # 2. start_polling() connects to Telegram
     await application.updater.start_polling(drop_pending_updates=True)
-    # 3. start() begins processing updates
     await application.start()
     
     logger.info("Bot has started successfully and is polling.")
-
 
 if __name__ == "__main__":
     asyncio.run(main())
