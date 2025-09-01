@@ -20,7 +20,7 @@ from telegram.ext import (
 # --- Configuration ---
 BOT_TOKEN = "8107253903:AAFwss6BKmUhKdSpSThQWxAiLE0CzKLIdJA"
 DOWNLOAD_PATH = "downloads"
-MAX_FILE_SIZE_MB = 48  # Set slightly below 50MB for safety
+MAX_FILE_SIZE_MB = 47  # Set slightly below 50MB for safety
 
 # --- States for ConversationHandler ---
 CHOOSING_FORMAT, DOWNLOADING = range(2)
