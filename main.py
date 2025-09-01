@@ -18,7 +18,7 @@ from telegram.ext import (
 )
 
 # --- Configuration ---
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+BOT_TOKEN = "8107253903:AAFwss6BKmUhKdSpSThQWxAiLE0CzKLIdJA"
 DOWNLOAD_PATH = "downloads"
 MAX_FILE_SIZE_MB = 48  # Set slightly below 50MB for safety
 
@@ -222,25 +222,30 @@ async def main() -> None:
     # The application object
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Run the download worker as a background task
+    # This line sets up the worker to run in the background
     application.post_init = download_worker
 
-    # --- Conversation Handler ---
+    # --- Conversation Handler with the per_message fix ---
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start), MessageHandler(filters.TEXT & ~filters.COMMAND, ask_for_format)],
         states={
             CHOOSING_FORMAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_for_format)],
-            # REMOVED per_message=False from the line below
             DOWNLOADING: [CallbackQueryHandler(process_download_choice)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        # ADDED per_message=False to the ConversationHandler itself
-        per_message=False
+        per_message=False  # Correct location for this argument
     )
+
+    application.add_handler(conv_handler)
     
-    # Initialize the application and start the updater to drop pending updates
+    logger.info("Bot starting...")
+
+    # This startup sequence is crucial
+    # 1. initialize() runs the post_init worker
     await application.initialize()
+    # 2. start_polling() connects to Telegram
     await application.updater.start_polling(drop_pending_updates=True)
+    # 3. start() begins processing updates
     await application.start()
     
     logger.info("Bot has started successfully and is polling.")
@@ -248,3 +253,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
