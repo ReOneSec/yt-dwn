@@ -217,18 +217,21 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-def main() -> None:
+async def main() -> None:
     """Run the bot."""
+    # The application object
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Create and run the download worker as a background task
-    asyncio.create_task(download_worker(application))
+    # Run the download worker as a background task
+    application.post_init = download_worker
 
+    # --- Conversation Handler ---
+    # We add per_message=False to the CallbackQueryHandler to resolve the PTBUserWarning
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start), MessageHandler(filters.TEXT & ~filters.COMMAND, ask_for_format)],
         states={
             CHOOSING_FORMAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_for_format)],
-            DOWNLOADING: [CallbackQueryHandler(process_download_choice)],
+            DOWNLOADING: [CallbackQueryHandler(process_download_choice, per_message=False)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
@@ -236,8 +239,14 @@ def main() -> None:
     application.add_handler(conv_handler)
     
     logger.info("Bot starting...")
-    application.run_polling()
+
+    # Initialize the application and start the updater to drop pending updates
+    await application.initialize()
+    await application.updater.start_polling(drop_pending_updates=True)
+    await application.start()
+    
+    logger.info("Bot has started successfully and is polling.")
+
 
 if __name__ == "__main__":
-    main()
-        
+    asyncio.run(main())
